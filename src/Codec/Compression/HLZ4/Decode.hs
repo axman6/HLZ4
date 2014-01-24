@@ -173,36 +173,51 @@ getDestProgress n = PtrParser $ \s@(_,_,_,drem) -> return $ Right (s, n-drem)
 
 -- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
 -- Returns the number of bytes 
-decodeSequence :: PtrParser ()
+decodeSequence :: PtrParser Int
 decodeSequence = do
+    sremBefore <- getSrcRemaining
     ensureSrc 1
     token <- getWord8
     let lLen = fromIntegral $ (token .&. 0xF0) `shiftR` 4
         mLen = fromIntegral $ (token .&. 0x0F) + 4
+    -- Write literals
     litLength <- if lLen == 15 
                 then (15+) `fmap` getLength 
                 else return lLen
-    ensureSrc  litLength
-    ensureDest litLength
+    ensureBoth litLength
     transfer   litLength
-    b <- atSrcEnd
-    if b
-        then return ()
-        else do
+    
+    -- copy length from offset
+    drem <- getDestRemaining
+    when (drem > 0) $ do
+        ensureSrc 2
         offset <- getWord16LE
         matchLen <- if mLen == 19
             then (19+) `fmap` getLength
             else return mLen
         ensureDest matchLen
         lookback matchLen (fromIntegral offset)
+    getSrcProgress sremBefore
+
+decodeSequences :: Int -> PtrParser ()
+decodeSequences len 
+    | len < 0   = fail "decodeSequence: read more than block length bytes from source"
+    | len == 0  = return ()
+    | otherwise = do
+        ssize <- decodeSequence
+        decodeSequences (len-ssize)
     
 getBlock :: PtrParser ()
 getBlock = do
-    len <- getWord32LE
-    if testBit len 31 then do
-        ensureBoth (fromIntegral len)
+    len' <- getWord32LE
+    let len = fromIntegral len'
+    setDestination (abs len)
+    if testBit len' 31 then do
+        ensureBoth (-len)
+        transfer (-len)
     else
-            undefined
+        decodeSequences len
+        
     
 
 
