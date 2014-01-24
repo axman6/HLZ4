@@ -9,16 +9,24 @@ module Codec.Compression.HLZ4.Decode
 import Data.ByteString (ByteString)
 import Data.ByteString.Internal (toForeignPtr)
 import Foreign.Storable (peekByteOff, peek, poke)
+import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils as F (copyBytes)
 import Foreign.Ptr (Ptr, plusPtr)
 import Data.Word (Word8, Word16, Word32)
 import Data.Bits ((.|.), (.&.), shiftR, testBit)
+import Control.Monad (when)
 type P8 = Ptr Word8
 type PtrState = (P8, P8, Int, Int)
 
 -- | A PtrParser is a monad which keeps track of the src and dst arrays
 -- and how many bytes are left in both
 newtype PtrParser a = PtrParser (PtrState -> IO (Either String (PtrState, a)))
+
+runPtrParser :: PtrParser a -> PtrState -> IO (Either String (PtrState, a))
+runPtrParser (PtrParser f) s = f s
+
+
+
 
 instance Monad PtrParser where
     return a = PtrParser $ \s -> return $ Right (s,a)
@@ -27,6 +35,7 @@ instance Monad PtrParser where
         case x of
             Right (s', a) -> let PtrParser f' = f a in f' s'
             Left str      -> return $ Left str
+    fail str = PtrParser $ \_ -> return $ Left str
 
 
 instance Functor PtrParser where
@@ -83,6 +92,12 @@ advanceDest n = PtrParser $ \s ->
     return $ Right (advanceDestState n s,())
 
 
+getSrcRemaining :: PtrParser Int
+getSrcRemaining = PtrParser $ \s@(_,_,srem,_) -> return $ Right (s,srem)
+
+getDestRemaining :: PtrParser Int
+getDestRemaining = PtrParser $ \s@(_,_,_,drem) -> return $ Right (s,drem)
+
 peekByte :: Ptr Word8 -> Int -> IO Word8
 peekByte = peekByteOff
 
@@ -108,6 +123,12 @@ getWord32LE = PtrParser $ \s@(src,_,_,_) -> do
     d <- fromIntegral `fmap` peekByte src 3
     return $ Right (advanceSrcState 4 s,(a `shiftR` 24 .|. b `shiftR` 16 .|. c `shiftR` 8 .|. d))
 {-# INLINE getWord32LE #-}
+
+
+setDestination :: Int -> PtrParser ()
+setDestination n = PtrParser $ \(src, _, srem, _) -> do
+    dst <- mallocBytes n
+    return $ Right ((src, dst, srem, n), ())
 
 -- | Decodes a number encoded using repeated values of 255 and returns how many bytes were used
 getLength :: PtrParser Int
@@ -141,7 +162,13 @@ lookback count offset = PtrParser $ \s@(_,dst,_,_) -> do
         mmove dest src n = peek src >>= poke dest >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
     mmove dst (dst `plusPtr` (-offset)) count
     return $ Right (advanceDestState count s,())
-      
+
+
+getSrcProgress :: Int -> PtrParser Int
+getSrcProgress n = PtrParser $ \s@(_,_,srem,_) -> return $ Right (s, n-srem)
+
+getDestProgress :: Int -> PtrParser Int
+getDestProgress n = PtrParser $ \s@(_,_,_,drem) -> return $ Right (s, n-drem)
 
 
 -- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
