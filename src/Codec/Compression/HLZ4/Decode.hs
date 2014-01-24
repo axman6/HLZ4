@@ -81,3 +81,63 @@ advanceSrc n = PtrParser $ \s ->
 advanceDest :: Int -> PtrParser ()
 advanceDest n = PtrParser $ \s ->
     return $ Right (advanceDestState n s,())
+
+
+peekByte :: Ptr Word8 -> Int -> IO Word8
+peekByte = peekByteOff
+
+getWord8 :: PtrParser Word8
+getWord8 = PtrParser $ \s@(src,dst,srem,drem) -> do
+    b <- peek src
+    return $ Right (advanceSrcState 1 s,b)
+{-# INLINE getWord8 #-}
+
+getWord16LE :: PtrParser Word16
+getWord16LE = PtrParser $ \s@(src,_,_,_) -> do
+    a <- fromIntegral `fmap` peekByte src 0
+    b <- fromIntegral `fmap` peekByte src 1
+    return $ Right (advanceSrcState 2 s,(a `shiftR` 8 .|. b))
+{-# INLINE getWord16LE #-}
+
+
+getWord32LE :: PtrParser Word32
+getWord32LE = PtrParser $ \s@(src,_,_,_) -> do
+    a <- fromIntegral `fmap` peekByte src 0
+    b <- fromIntegral `fmap` peekByte src 1
+    c <- fromIntegral `fmap` peekByte src 2
+    d <- fromIntegral `fmap` peekByte src 3
+    return $ Right (advanceSrcState 4 s,(a `shiftR` 24 .|. b `shiftR` 16 .|. c `shiftR` 8 .|. d))
+{-# INLINE getWord32LE #-}
+
+-- | Decodes a number encoded using repeated values of 255 and returns how many bytes were used
+getLength :: PtrParser Int
+getLength = PtrParser $ \s@(src,_,srem,_) -> do
+    let go !p 0  !_  = return $ Left "getLength: reached end of source."
+        go  p sr n   =  do
+            b <- peek p
+            case b :: Word8 of
+                255 -> go (p `plusPtr` 1) (sr-1) (n+255)
+                _ -> return $ Right (n + fromIntegral b, srem-(sr-1))
+    
+    r <- go src srem 0
+    return $! case r of
+        Right (n,len) -> Right (advanceSrcState len s, n)
+        Left str      -> Left str    
+{-# INLINE getLength #-}
+
+-- | Moves `count` bytes of data from `offset` bytes before current position into
+-- the current position in the destination, and advances the state. Unchecked.
+transfer :: Int -> PtrParser ()
+transfer count = PtrParser $ \s@(src,dst,_,_) -> do
+    F.copyBytes dst src count
+    return $ Right (advanceBothState count s,())
+
+-- | Moves `count` bytes of data from `offset` bytes before current position into
+-- the current position in the destination, and advances the state. Unchecked.
+lookback :: Int -> Int -> PtrParser ()
+lookback count offset = PtrParser $ \s@(_,dst,_,_) -> do
+    let mmove :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
+        mmove dest src 0 = return ()
+        mmove dest src n = peek src >>= poke dest >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
+    mmove dst (dst `plusPtr` (-offset)) count
+    return $ Right (advanceDestState count s,())
