@@ -141,3 +141,42 @@ lookback count offset = PtrParser $ \s@(_,dst,_,_) -> do
         mmove dest src n = peek src >>= poke dest >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
     mmove dst (dst `plusPtr` (-offset)) count
     return $ Right (advanceDestState count s,())
+      
+
+
+-- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
+-- Returns the number of bytes 
+decodeSequence :: PtrParser ()
+decodeSequence = do
+    ensureSrc 1
+    token <- getWord8
+    let lLen = fromIntegral $ (token .&. 0xF0) `shiftR` 4
+        mLen = fromIntegral $ (token .&. 0x0F) + 4
+    litLength <- if lLen == 15 
+                then (15+) `fmap` getLength 
+                else return lLen
+    ensureSrc  litLength
+    ensureDest litLength
+    transfer   litLength
+    b <- atSrcEnd
+    if b
+        then return ()
+        else do
+        offset <- getWord16LE
+        matchLen <- if mLen == 19
+            then (19+) `fmap` getLength
+            else return mLen
+        ensureDest matchLen
+        lookback matchLen (fromIntegral offset)
+    
+getBlock :: PtrParser ()
+getBlock = do
+    len <- getWord32LE
+    if testBit len 31 then do
+        ensureBoth (fromIntegral len)
+    else
+            undefined
+    
+
+
+
