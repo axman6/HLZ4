@@ -11,6 +11,8 @@ module Codec.Compression.HLZ4.Decode
 import Control.Monad (when)
 import Control.Monad.IO.Class
 
+import Control.Applicative ((<$>))
+
 import Data.Bits ((.|.), (.&.), shiftR, shiftL, testBit, clearBit)
 
 import Data.ByteString as BS (ByteString, pack, drop, length)
@@ -60,6 +62,7 @@ data PPResult a
     | PPPartial (PtrParser a)
         -- ^ More input is required, pass in a Ptr Word8 and the length in bytes
     | PPSetDest Int (PtrParser a)
+        -- ^ Allocate a new destination Ptr of the given size and continue parsing with the provided parser.
     | PPError String
         -- ^ Something bad happened
 
@@ -118,7 +121,6 @@ startPParse :: Show a => PtrParser a -> ByteString -> IO HLZ4Result
 startPParse p bs = do
    let (srcptr, off, srem) = toForeignPtr bs
    r <- runPP bs (nullPtr,0) ((unsafeForeignPtrToPtr srcptr `plusPtr` off),nullPtr,srem,0) p
-   touchForeignPtr srcptr
    return r
 
 
@@ -148,7 +150,6 @@ feed :: Show a => (P8,Int) -> PtrState -> PtrParser a -> ByteString -> IO HLZ4Re
 feed res (_,dst,_,drem) g bs = do
     let (srcptr, off, srem) = toForeignPtr bs
     r <- runPP bs res ((unsafeForeignPtrToPtr srcptr `plusPtr` off),dst,srem,drem) g
-    touchForeignPtr srcptr
     return r
 
 
@@ -261,9 +262,10 @@ transfer count = do
                 transfer (count-srem)
           | otherwise -> err $ "transfer: transfer of " ++ show count ++ " bytes would overflow destination buffer"
 
--- 
+
 -- | Moves `count` bytes of data from `offset` bytes before current position into
--- the current position in the destination, and advances the state. Unchecked.
+-- the current position in the destination, and advances the state. If count is greater
+-- than the space remaining in the destination buffer, an error is returned.
 lookback :: Int -> Int -> PtrParser ()
 lookback count offset = do
     (_,dst,_,drem) <- getState
@@ -275,13 +277,19 @@ lookback count offset = do
     liftIO $ mmove dst (dst `plusPtr` (-offset)) count
     advanceDest count
 
--- 
--- 
+
+-- | Utiility functions used to measure how much progress has been made
+-- by a sub parser. Use with the result of getSrcRemaining to measure how
+-- how many source bytes have been consumed.
+--
+-- TODO: This will return incorrect results if more input is requested
+-- after tgetSrcRemaining is called. Fix or remove
 getSrcProgress :: Int -> PtrParser Int
 getSrcProgress n = do
     srem <- getSrcRemaining
     return $ n-srem
 
+-- | Same as `getSrcProgress` for the destination buffer
 getDestProgress :: Int -> PtrParser Int
 getDestProgress n = do
     drem <- getDestRemaining
@@ -292,26 +300,27 @@ getDestProgress n = do
 -- Returns the number of bytes 
 decodeSequence :: PtrParser Int
 decodeSequence = do
-    sremBefore <- getDestRemaining
     token <- getWord8
     let lLen = fromIntegral $ (token .&. 0xF0) `shiftR` 4
         mLen = fromIntegral $ (token .&. 0x0F) + 4
     -- Write literals
     litLength <- if lLen == 15 
-                then (15+) `fmap` getLength 
+                then (15+) <$> getLength 
                 else return lLen
-    transfer   litLength
+    transfer litLength
     
     -- copy length from offset
     drem <- getDestRemaining
-    when (drem > 0) $ do
-        offset <- getWord16LE
-        matchLen <- if mLen == 19
-            then (19+) `fmap` getLength
-            else return mLen
-        lookback matchLen (fromIntegral offset)
-    
-    getDestProgress sremBefore
+    if (drem > 0) then do
+            offset <- getWord16LE
+            matchLen <- if mLen == 19
+                then (19+) <$> getLength
+                else return mLen
+            lookback matchLen (fromIntegral offset)
+            return (litLen+matchLen)
+        else
+            return litLen
+
 
 decodeSequences :: Int -> PtrParser ()
 decodeSequences len 
