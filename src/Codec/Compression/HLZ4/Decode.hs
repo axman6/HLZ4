@@ -282,17 +282,7 @@ lookback count offset = do
     liftIO $ mmove (dst `plusPtr` doff) (dst `plusPtr` (doff-offset)) count
     advanceDest count
 
--- 
--- 
-getSrcProgress :: Int -> PtrParser Int
-getSrcProgress n = do
-    srem <- getSrcRemaining
-    return $ n-srem
 
-getDestProgress :: Int -> PtrParser Int
-getDestProgress n = do
-    drem <- getDestRemaining
-    return $ n-drem
 getByteString :: Int -> PtrParser ByteString
 getByteString len = do
     bsptr <- liftIO $ mallocBytes len
@@ -328,14 +318,15 @@ decodeSequence = do
     
     -- copy length from offset
     drem <- getDestRemaining
-    when (drem > 0) $ do
+    if drem > 0 then do
         offset <- getWord16LE
         matchLen <- if mLen == 19
             then (19+) `fmap` getLength
             else return mLen
         lookback matchLen (fromIntegral offset)
-    
-    getDestProgress sremBefore
+        return (litLength + matchLen)
+    else
+        return litLength
 
 decodeSequences :: Int -> PtrParser ()
 decodeSequences len 
