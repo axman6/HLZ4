@@ -11,6 +11,8 @@ module Codec.Compression.HLZ4.Decode
 import Control.Monad (when)
 import Control.Monad.IO.Class
 
+import Control.Applicative ((<$>))
+
 import Data.Bits ((.|.), (.&.), shiftR, shiftL, testBit, clearBit)
 
 import Data.ByteString as BS (ByteString, pack, drop, length)
@@ -61,6 +63,7 @@ data PPResult a
     | PPPartial (PtrParser a)
         -- ^ More input is required, pass in a Ptr Word8 and the length in bytes
     | PPSetDest Int (PtrParser a)
+        -- ^ Allocate a new destination Ptr of the given size and continue parsing with the provided parser.
     | PPError String
         -- ^ Something bad happened
 
@@ -265,9 +268,10 @@ transfer count = do
                               ++ " bytes would overflow destination buffer "
                               ++ show (doff,dlen)
 
--- 
+
 -- | Moves `count` bytes of data from `offset` bytes before current position into
--- the current position in the destination, and advances the state. Unchecked.
+-- the current position in the destination, and advances the state. If count is greater
+-- than the space remaining in the destination buffer, an error is returned.
 lookback :: Int -> Int -> PtrParser ()
 lookback count offset = do
     (_,_,_,dst,doff,dlen) <- getState
@@ -289,7 +293,7 @@ getByteString len = do
     go bsptr len
     fptr <- liftIO $ newForeignPtr finalizerFree bsptr
     return $ fromForeignPtr fptr 0 len
-    
+
     where go ptr len = do
             (src,soff,slen,_,_,_) <- getState
             if soff + len < slen
@@ -302,7 +306,6 @@ getByteString len = do
                     demandInput
                     go (ptr `plusPtr` srem) (len-srem)
 
-
 -- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
 -- Returns the number of bytes written to the destination
 decodeSequence :: PtrParser Int
@@ -312,18 +315,18 @@ decodeSequence = do
         mLen = fromIntegral $ (token .&. 0x0F) + 4
     -- Write literals
     litLength <- if lLen == 15 
-                then (15+) `fmap` getLength 
+                then (15+) <$> getLength 
                 else return lLen
-    transfer   litLength
+    transfer litLength
     
     -- copy length from offset
     drem <- getDestRemaining
     if drem > 0 then do
-        offset <- getWord16LE
-        matchLen <- if mLen == 19
-            then (19+) `fmap` getLength
-            else return mLen
-        lookback matchLen (fromIntegral offset)
+            offset <- getWord16LE
+            matchLen <- if mLen == 19
+                then (19+) <$> getLength
+                else return mLen
+            lookback matchLen (fromIntegral offset)
         return (litLength + matchLen)
     else
         return litLength
