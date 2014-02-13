@@ -293,6 +293,24 @@ getDestProgress :: Int -> PtrParser Int
 getDestProgress n = do
     drem <- getDestRemaining
     return $ n-drem
+getByteString :: Int -> PtrParser ByteString
+getByteString len = do
+    bsptr <- liftIO $ mallocBytes len
+    go bsptr len
+    fptr <- liftIO $ newForeignPtr finalizerFree bsptr
+    return $ fromForeignPtr fptr 0 len
+    
+    where go ptr len = do
+            (src,soff,slen,_,_,_) <- getState
+            if soff + len < slen
+                then do
+                    liftIO $ F.copyBytes ptr (src `plusPtr` soff) len
+                    advanceSrc len
+                else do
+                    let srem = slen-soff
+                    liftIO $ F.copyBytes ptr (src `plusPtr` soff) srem
+                    demandInput
+                    go (ptr `plusPtr` srem) (len-srem)
 
 
 -- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
