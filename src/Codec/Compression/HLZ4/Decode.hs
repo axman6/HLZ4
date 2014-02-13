@@ -32,20 +32,21 @@ debug :: Bool
 debug = False
 
 type P8 = Ptr Word8
-type PtrState = (P8, P8, Int, Int)
+-- | tuple of src and dest pointers, offset into and their lengths
+type PtrState = (P8, Int, Int, P8, Int, Int)
 
 advanceSrcState :: Int -> PtrState -> PtrState
-advanceSrcState n (src,dst,srem,drem) =
-    (src `plusPtr` n, dst, srem - n, drem)
+advanceSrcState n (src, soff, slen, dst, doff, dlen) =
+    (src, soff+n, slen, dst, doff, dlen)
 
 advanceDestState :: Int -> PtrState -> PtrState
-advanceDestState n (src,dst,srem,drem) =
-    (src, dst `plusPtr` n, srem, drem - n)
+advanceDestState n (src, soff, slen, dst, doff, dlen) =
+    (src, soff, slen, dst, doff + n, dlen)
 
 
 advanceBothState :: Int -> PtrState -> PtrState
-advanceBothState n (src,dst,srem,drem) =
-    (src `plusPtr` n, dst `plusPtr` n, srem - n, drem - n)
+advanceBothState n (src, soff, slen, dst, doff, dlen) =
+    (src, soff+n, slen, dst, doff + n, dlen)
 
 
 
@@ -95,10 +96,10 @@ instance MonadIO PtrParser where
         x <- m
         return (s,PPDone x)
     
-setSrc :: (P8,Int) -> PtrParser ()
-setSrc (src,srem) = do 
-    PtrParser $ \(_,dst,_,drem) ->
-        return ((src,dst,srem,drem),PPDone ())
+setSrc :: (P8,Int,Int) -> PtrParser ()
+setSrc (src,soff,slen) = do 
+    PtrParser $ \(_,_,_,dst,doff,dlen) ->
+        return ((src,soff,slen,dst,doff,dlen),PPDone ())
 
 
 demandInput :: PtrParser ()
@@ -116,38 +117,37 @@ modifyState f = PtrParser $ \s -> return (f s,PPDone ())
 
 startPParse :: Show a => PtrParser a -> ByteString -> IO HLZ4Result
 startPParse p bs = do
-   let (srcptr, off, srem) = toForeignPtr bs
-   r <- runPP bs (nullPtr,0) ((unsafeForeignPtrToPtr srcptr `plusPtr` off),nullPtr,srem,0) p
+   let (srcptr, off, len) = toForeignPtr bs
+   r <- runPP bs (unsafeForeignPtrToPtr srcptr, off, len, nullPtr, 0, 0) p
    touchForeignPtr srcptr
    return r
 
 
 
-runPP :: Show a => ByteString -> (P8,Int) -> PtrState -> PtrParser a -> IO HLZ4Result
-runPP input r s (PtrParser p) = do
-    (s'@(src,_,srem,_),x) <- p s
+runPP :: Show a => ByteString -> PtrState -> PtrParser a -> IO HLZ4Result
+runPP input s (PtrParser p) = do
+    (s'@(src,soff,slen,dst,doff,dlen),x) <- p s
     when debug $ print x
     case x of
         PPDone _  -> do
-            let (dst,len) = r
             fptr <- newForeignPtr finalizerFree dst
-            let res = (fromForeignPtr fptr 0 len)
-            if (srem == 0)
+            let res = (fromForeignPtr fptr 0 doff)
+            if (soff == slen)
                 then return $ Done res
-                else return $ Block res (BS.drop (BS.length input - srem) input)
+                else return $ Block res (BS.drop soff input)
                     
         PPPartial g -> 
-            return $ Partial (feed r s' g)
+            return $ Partial (feed s' g)
         PPSetDest len' p' -> do
             dst' <- mallocBytes len'
-            runPP input (dst',len') (src,dst',srem,len') p'
+            runPP input (src,soff,slen,dst',0,len') p'
         PPError str -> return $ Error str
 
 
-feed :: Show a => (P8,Int) -> PtrState -> PtrParser a -> ByteString -> IO HLZ4Result
-feed res (_,dst,_,drem) g bs = do
-    let (srcptr, off, srem) = toForeignPtr bs
-    r <- runPP bs res ((unsafeForeignPtrToPtr srcptr `plusPtr` off),dst,srem,drem) g
+feed :: Show a => PtrState -> PtrParser a -> ByteString -> IO HLZ4Result
+feed (_,_,_,dst,doff,dlen) g bs = do
+    let (srcptr, off, len) = toForeignPtr bs
+    r <- runPP bs (unsafeForeignPtrToPtr srcptr, off, len,dst,doff,dlen) g
     touchForeignPtr srcptr
     return r
 
@@ -173,10 +173,10 @@ err str = PtrParser $ \s -> return $ (s,PPError str)
 
 
 getSrcRemaining :: PtrParser Int
-getSrcRemaining = getState >>= \(_,_,srem,_) -> return srem
+getSrcRemaining = getState >>= \(_,soff,slen,_,_,_) -> return (slen-soff)
 
 getDestRemaining :: PtrParser Int
-getDestRemaining = getState >>= \(_,_,_,drem) -> return drem
+getDestRemaining = getState >>= \(_,_,_,_,doff,dlen) -> return (dlen-doff)
 
 
 
@@ -198,10 +198,10 @@ peekByte = peekByteOff
 
 getWord8 :: PtrParser Word8
 getWord8 = do
-    (src,_,srem,_) <- getState
-    if srem >= 1
+    (src,soff,slen,_,_,_) <- getState
+    if soff < slen
         then do
-            b <- liftIO $ peekByte src 0
+            b <- liftIO $ peekByte src soff
             advanceSrc 1
             when debug $ liftIO $ printf "getWord8: %d\n" b
             return b
@@ -249,30 +249,37 @@ getLength = go 0 where
 -- If there is not enough room in the destination and error is produced.
 transfer :: Int -> PtrParser ()
 transfer count = do
-    (src,dst,srem,drem) <- getState
+    (src,soff,slen,dst,doff,dlen) <- getState
+    let srem = slen - soff
     case () of
-        _ | count <= srem && count <= drem -> do
-                liftIO $ F.copyBytes dst src count
+        _ | soff + count < slen && doff + count < dlen -> do
+                liftIO $ F.copyBytes (dst `plusPtr` doff) (src `plusPtr` soff) count
                 advanceBoth count
-          | count > srem && count <= drem -> do
-                liftIO $ F.copyBytes dst src srem
+          | soff + count > slen && doff + count < dlen -> do
+                liftIO $ F.copyBytes (dst `plusPtr` doff) (src `plusPtr` soff) srem
                 advanceDest srem
                 demandInput
                 transfer (count-srem)
-          | otherwise -> err $ "transfer: transfer of " ++ show count ++ " bytes would overflow destination buffer"
+          | otherwise -> err $ "transfer: transfer of " 
+                              ++ show count
+                              ++ " bytes would overflow destination buffer "
+                              ++ show (doff,dlen)
 
 -- 
 -- | Moves `count` bytes of data from `offset` bytes before current position into
 -- the current position in the destination, and advances the state. Unchecked.
 lookback :: Int -> Int -> PtrParser ()
 lookback count offset = do
-    (_,dst,_,drem) <- getState
-    when (count > drem) $ err $ "lookback: copy of " ++ show count ++ " bytes would overflow destination buffer"
+    (_,_,_,dst,doff,dlen) <- getState
+    when (doff + count > dlen) $ 
+        err $ "lookback: copy of " ++ show count ++ " bytes would overflow destination buffer"
+    when (offset > doff) $
+        err $ "lookback: copy from offset " ++ show offset ++ " before beginning of buffer, dest offset: " ++ show doff
     let mmove :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
         mmove !_ !_ 0 = return ()
         mmove dest src n = peek src >>= poke dest >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
     
-    liftIO $ mmove dst (dst `plusPtr` (-offset)) count
+    liftIO $ mmove (dst `plusPtr` doff) (dst `plusPtr` (doff-offset)) count
     advanceDest count
 
 -- 
@@ -289,12 +296,11 @@ getDestProgress n = do
 
 
 -- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
--- Returns the number of bytes 
+-- Returns the number of bytes written to the destination
 decodeSequence :: PtrParser Int
 decodeSequence = do
-    sremBefore <- getDestRemaining
     token <- getWord8
-    let lLen = fromIntegral $ (token .&. 0xF0) `shiftR` 4
+    let lLen = fromIntegral $ token `shiftR` 4
         mLen = fromIntegral $ (token .&. 0x0F) + 4
     -- Write literals
     litLength <- if lLen == 15 
