@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns, ExistentialQuantification, 
-    TypeSynonymInstances, FlexibleInstances, MultiParamTypeClasses #-}
+    TypeSynonymInstances, FlexibleInstances, MultiParamTypeClasses,
+    RecordWildCards #-}
 
 module Codec.Compression.HLZ4.Decode
     -- (
@@ -11,7 +12,7 @@ module Codec.Compression.HLZ4.Decode
 import Control.Monad (when)
 import Control.Monad.IO.Class
 
-import Control.Applicative ((<$>))
+import Control.Applicative ((<$>), Applicative(..))
 
 import Data.Bits ((.|.), (.&.), shiftR, shiftL, testBit, clearBit)
 
@@ -25,7 +26,7 @@ import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 
 import Foreign.Marshal.Alloc (mallocBytes, finalizerFree)
 import Foreign.Marshal.Utils as F (copyBytes)
-import Foreign.Ptr (Ptr, plusPtr, nullPtr)
+import Foreign.Ptr (Ptr, plusPtr, nullPtr, castPtr)
 import Foreign.Storable (peekByteOff, peek, poke)
 
 import Text.Printf
@@ -35,122 +36,127 @@ debug = False
 
 type P8 = Ptr Word8
 -- | tuple of src and dest pointers, offset into and their lengths
-type PtrState = (P8, Int, Int, P8, Int, Int)
+-- type PtrState = (P8, Int, Int, P8, Int, Int)
+data PtrState = PS { 
+    _src  :: !P8,
+    _soff :: !Int,
+    _slen :: !Int,
+    _dst  :: !P8,
+    _doff :: !Int,
+    _dlen :: !Int}
 
 advanceSrcState :: Int -> PtrState -> PtrState
-advanceSrcState n (src, soff, slen, dst, doff, dlen) =
-    (src, soff+n, slen, dst, doff, dlen)
+advanceSrcState n st =
+    st {_soff = _soff st + n}
 
 advanceDestState :: Int -> PtrState -> PtrState
-advanceDestState n (src, soff, slen, dst, doff, dlen) =
-    (src, soff, slen, dst, doff + n, dlen)
+advanceDestState n st =
+    st {_doff = _doff st + n}
 
 
 advanceBothState :: Int -> PtrState -> PtrState
-advanceBothState n (src, soff, slen, dst, doff, dlen) =
-    (src, soff+n, slen, dst, doff + n, dlen)
+advanceBothState n st =
+    st {_soff = _soff st + n, _doff = _doff st + n}
 
 
 
-newtype PtrParser a = PtrParser (PtrState -> IO (PtrState, PPResult a))
+newtype Decoder a = Decoder (PtrState -> IO (PtrState, DResult a))
 
-runPtrParser :: PtrParser a -> PtrState -> IO (PtrState, PPResult a)
-runPtrParser (PtrParser p) = p
+runDecoder :: Decoder a -> PtrState -> IO (PtrState, DResult a)
+runDecoder (Decoder p) = p
 
-data PPResult a
-    = PPDone a
+data DResult a
+    = DDone a
             -- ^ returns the src ptr and the length remaining, and a pointer to 
-    | PPPartial (PtrParser a)
+    | DPartial (Decoder a)
         -- ^ More input is required, pass in a Ptr Word8 and the length in bytes
-    | PPSetDest Int (PtrParser a)
-        -- ^ Allocate a new destination Ptr of the given size and continue parsing with the provided parser.
-    | PPError String
+    | DError String
         -- ^ Something bad happened
 
-instance Show a => Show (PPResult a) where
+instance Show a => Show (DResult a) where
     show x = case x of
-        PPDone a -> "PPDone " ++ show a
-        PPError str -> "PPError: " ++ str
-        PPSetDest n _ -> "PPSetDest " ++ show n
-        PPPartial _ -> "PPPartial <p>"
+        DDone a -> "DDone " ++ show a
+        DError str -> "DError: " ++ str
+        DPartial _ -> "DPartial <p>"
 
 
-instance Functor PtrParser where
+instance Functor Decoder where
     fmap f m = m >>= return . f
 
+instance Applicative Decoder where
+    pure = return
+    mf <*> ma = mf >>= \f -> ma >>= \a -> return (f a)
 
-
-instance Monad PtrParser where
-    return a = PtrParser $ \s -> return (s,PPDone a)
-    PtrParser m >>= f = PtrParser $ \s -> do
+instance Monad Decoder where
+    return a = Decoder $ \s -> return (s,DDone a)
+    {-# INLINE return #-}
+    Decoder m >>= f = Decoder $ \s -> do
         (s',r) <- m s
         case r of
-            PPDone x   ->
-                let PtrParser fx = f x in fx s'
-            PPPartial g  ->
-                return $ (s',PPPartial (g >>= f))
-            PPSetDest len p ->
-                return (s',PPSetDest len (p >>= f))
-            PPError str  ->
-                return (s',PPError str)
+            DDone x   ->
+                let Decoder fx = f x in fx s'
+            DPartial g  ->
+                return $ (s',DPartial (g >>= f))
+            DError str  ->
+                return (s',DError str)
+    {-# INLINE (>>=) #-}
 
-instance MonadIO PtrParser where
-    liftIO m = PtrParser $ \s -> do
+
+
+instance MonadIO Decoder where
+    liftIO m = Decoder $ \s -> do
         x <- m
-        return (s,PPDone x)
+        return (s,DDone x)
     
-setSrc :: (P8,Int,Int) -> PtrParser ()
-setSrc (src,soff,slen) = do 
-    PtrParser $ \(_,_,_,dst,doff,dlen) ->
-        return ((src,soff,slen,dst,doff,dlen),PPDone ())
+-- setSrc :: (P8,Int,Int) -> Decoder ()
+-- setSrc (src,soff,slen) = do 
+--     Decoder $ \(_,_,_,dst,doff,dlen) ->
+--         return ((src,soff,slen,dst,doff,dlen),DDone ())
 
 
-demandInput :: PtrParser ()
-demandInput = PtrParser $ \s -> return (s,PPPartial (return ()))
+demandInput :: Decoder ()
+demandInput = Decoder $ \s -> return (s,DPartial (return ()))
 
-getState :: PtrParser PtrState
-getState = PtrParser $ \s -> return (s, PPDone s)
+getState :: Decoder PtrState
+getState = Decoder $ \s -> return (s, DDone s)
 
-putState :: PtrState -> PtrParser ()
-putState s = PtrParser $ \_s -> return (s,PPDone ())
+putState :: PtrState -> Decoder ()
+putState s = Decoder $ \_s -> return (s,DDone ())
 
-modifyState :: (PtrState -> PtrState) -> PtrParser ()
-modifyState f = PtrParser $ \s -> return (f s,PPDone ())
+modifyState :: (PtrState -> PtrState) -> Decoder ()
+modifyState f = Decoder $ \s -> return (f s,DDone ())
 
 
-startPParse :: Show a => PtrParser a -> ByteString -> IO HLZ4Result
-startPParse p bs = do
+startDecoder :: Show a => Decoder a -> ByteString -> IO HLZ4Result
+startDecoder p bs = do
    let (srcptr, off, len) = toForeignPtr bs
-   r <- runPP bs (unsafeForeignPtrToPtr srcptr, off, len, nullPtr, 0, 0) p
+   r <- runD bs (PS (unsafeForeignPtrToPtr srcptr) off len nullPtr 0 0) p
    touchForeignPtr srcptr
    return r
 
 
 
-runPP :: Show a => ByteString -> PtrState -> PtrParser a -> IO HLZ4Result
-runPP input s (PtrParser p) = do
-    (s'@(src,soff,slen,dst,doff,dlen),x) <- p s
+runD :: Show a => ByteString -> PtrState -> Decoder a -> IO HLZ4Result
+runD input s (Decoder p) = do
+    (s',x) <- p s
     when debug $ print x
     case x of
-        PPDone _  -> do
-            fptr <- newForeignPtr finalizerFree dst
-            let res = (fromForeignPtr fptr 0 doff)
-            if (soff == slen)
+        DDone _  -> do
+            fptr <- newForeignPtr finalizerFree (_dst s')
+            let res = (fromForeignPtr fptr 0 (_doff s'))
+            if (_soff s' == _slen s')
                 then return $ Done res
-                else return $ Block res (BS.drop soff input)
+                else return $ Block res (BS.drop (_soff s') input)
                     
-        PPPartial g -> 
+        DPartial g -> 
             return $ Partial (feed s' g)
-        PPSetDest len' p' -> do
-            dst' <- mallocBytes len'
-            runPP input (src,soff,slen,dst',0,len') p'
-        PPError str -> return $ Error str
+        DError str -> return $ Error str
 
 
-feed :: Show a => PtrState -> PtrParser a -> ByteString -> IO HLZ4Result
-feed (_,_,_,dst,doff,dlen) g bs = do
+feed :: Show a => PtrState -> Decoder a -> ByteString -> IO HLZ4Result
+feed st g bs = do
     let (srcptr, off, len) = toForeignPtr bs
-    r <- runPP bs (unsafeForeignPtrToPtr srcptr, off, len,dst,doff,dlen) g
+    r <- runD bs (st {_src = unsafeForeignPtrToPtr srcptr, _soff = off, _slen = len}) g
     touchForeignPtr srcptr
     return r
 
@@ -170,75 +176,91 @@ instance Show HLZ4Result where
 
 
 
-err :: String -> PtrParser a
-err str = PtrParser $ \s -> return $ (s,PPError str)
+err :: String -> Decoder a
+err str = Decoder $ \s -> return $ (s,DError str)
 
 
 
-getSrcRemaining :: PtrParser Int
-getSrcRemaining = getState >>= \(_,soff,slen,_,_,_) -> return (slen-soff)
+getSrcRemaining :: Decoder Int
+getSrcRemaining = getState >>= \st -> return (_slen st - _soff st)
 
-getDestRemaining :: PtrParser Int
-getDestRemaining = getState >>= \(_,_,_,_,doff,dlen) -> return (dlen-doff)
-
-
+getDestRemaining :: Decoder Int
+getDestRemaining = getState >>= \st -> return (_dlen st - _doff st)
 
 
-advanceSrc :: Int -> PtrParser ()
+
+
+advanceSrc :: Int -> Decoder ()
 advanceSrc n = modifyState(advanceSrcState n)
 
-advanceDest :: Int -> PtrParser ()
+advanceDest :: Int -> Decoder ()
 advanceDest n = modifyState(advanceDestState n)
 
-advanceBoth :: Int -> PtrParser ()
+advanceBoth :: Int -> Decoder ()
 advanceBoth n = modifyState(advanceBothState n)
 
 
 peekByte :: Ptr Word8 -> Int -> IO Word8
 peekByte = peekByteOff
 
+fi8 :: Integral a => Word8 -> a
+fi8 = fromIntegral
 
-
-getWord8 :: PtrParser Word8
+getWord8 :: Decoder Word8
 getWord8 = do
-    (src,soff,slen,_,_,_) <- getState
-    if soff < slen
+    PS {..} <- getState
+    if _soff < _slen
         then do
-            b <- liftIO $ peekByte src soff
             advanceSrc 1
+            b <- liftIO $ peekByte _src _soff
             when debug $ liftIO $ printf "getWord8: %d\n" b
             return b
         else demandInput >> getWord8 
 {-# INLINE getWord8 #-}
 
-getWord16LE :: PtrParser Word16
+getWord16LE :: Decoder Word16
 getWord16LE = do
-    a' <- getWord8
-    b' <- getWord8
-    let [a,b] = map fromIntegral [a',b']
-    return (b `shiftL` 8 .|. a)
+    PS {..} <- getState
+    if _slen - _soff >= 2
+        then do
+            advanceSrc 2
+            liftIO $ peek (castPtr (_src `plusPtr` _soff))
+        else do
+            a <- getWord8
+            b <- getWord8
+            return (fi8 b `shiftL` 8 .|. fi8 a)
 {-# INLINE getWord16LE #-}
 
 
-getWord32LE :: PtrParser Word32
+getWord32LE :: Decoder Word32
 getWord32LE = do
-    a' <- getWord8
-    b' <- getWord8
-    c' <- getWord8
-    d' <- getWord8
-    let [a,b,c,d] = map fromIntegral [a',b',c',d']
-    return (d `shiftL` 24 .|. c `shiftL` 16 .|. b `shiftL` 8 .|. a)
+    PS {..} <- getState
+    if _slen - _soff >= 4
+        then do
+            advanceSrc 4
+            liftIO $ peek (castPtr (_src `plusPtr` _soff))
+        else do
+            a <- getWord8
+            b <- getWord8
+            c <- getWord8
+            d <- getWord8
+            return (fi8 d `shiftL` 24 .|.  fi8 c `shiftL` 16 .|. fi8 b `shiftL` 8 .|. fi8 a)
 {-# INLINE getWord32LE #-}
  
 
-allocateDest :: Int -> PtrParser ()
+-- | Allocate a new destination buffer, returning the bytestring representing the
+-- current destination buffer.
+allocateDest :: Int -> Decoder ByteString
 allocateDest n =
-    PtrParser $ \s-> do
-        return (s, PPSetDest n (return ()))
+    Decoder $ \st -> do
+        fptr <- newForeignPtr finalizerFree (_dst st)
+        let res = fromForeignPtr fptr 0 (_doff st)
+        dst' <- mallocBytes n
+        return ( st {_dst = dst', _doff = 0, _dlen = n}, DDone res)
 
 
 -- | Decodes a number encoded using repeated values of 255 and returns how many bytes were used
-getLength :: PtrParser Int
+getLength :: Decoder Int
 getLength = go 0 where
     go n = do
         b <- getWord8
@@ -250,44 +272,46 @@ getLength = go 0 where
 -- | Transfers `count` bytes from src into dest. If there are not enough
 -- bytes in src, the remaining bytes will be copied and more input demanded.
 -- If there is not enough room in the destination and error is produced.
-transfer :: Int -> PtrParser ()
+transfer :: Int -> Decoder ()
 transfer count = do
-    (src,soff,slen,dst,doff,dlen) <- getState
-    let srem = slen - soff
-    case () of
-        _ | soff + count < slen && doff + count < dlen -> do
-                liftIO $ F.copyBytes (dst `plusPtr` doff) (src `plusPtr` soff) count
+    PS {..} <- getState
+    if _doff + count >= _dlen 
+        then err $ "transfer: transfer of " 
+                 ++ show count
+                 ++ " bytes would overflow destination buffer "
+                 ++ show (_doff,_dlen)
+        else if _soff + count < _slen
+            then do
+                liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) count
                 advanceBoth count
-          | soff + count > slen && doff + count < dlen -> do
-                liftIO $ F.copyBytes (dst `plusPtr` doff) (src `plusPtr` soff) srem
+            else do
+                let srem = _slen - _soff
+                liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) srem
                 advanceDest srem
                 demandInput
                 transfer (count-srem)
-          | otherwise -> err $ "transfer: transfer of " 
-                              ++ show count
-                              ++ " bytes would overflow destination buffer "
-                              ++ show (doff,dlen)
 
 
 -- | Moves `count` bytes of data from `offset` bytes before current position into
 -- the current position in the destination, and advances the state. If count is greater
 -- than the space remaining in the destination buffer, an error is returned.
-lookback :: Int -> Int -> PtrParser ()
+lookback :: Int -> Int -> Decoder ()
 lookback count offset = do
-    (_,_,_,dst,doff,dlen) <- getState
-    when (doff + count > dlen) $ 
+    PS {..} <- getState
+    when (_doff + count > _dlen) $ 
         err $ "lookback: copy of " ++ show count ++ " bytes would overflow destination buffer"
-    when (offset > doff) $
-        err $ "lookback: copy from offset " ++ show offset ++ " before beginning of buffer, dest offset: " ++ show doff
+    when (offset > _doff) $
+        err $ "lookback: copy from offset " ++ show offset ++ " before beginning of buffer, dest offset: " ++ show _doff
     let mmove :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
         mmove !_ !_ 0 = return ()
-        mmove dest src n = peek src >>= poke dest >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
+        mmove dest src n = peek src >>= poke dest 
+                           >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
     
-    liftIO $ mmove (dst `plusPtr` doff) (dst `plusPtr` (doff-offset)) count
+    liftIO $ mmove (_dst `plusPtr` _doff) (_dst `plusPtr` (_doff-offset)) count
     advanceDest count
 
 
-getByteString :: Int -> PtrParser ByteString
+getByteString :: Int -> Decoder ByteString
 getByteString len = do
     bsptr <- liftIO $ mallocBytes len
     go bsptr len
@@ -295,20 +319,20 @@ getByteString len = do
     return $ fromForeignPtr fptr 0 len
 
     where go ptr len = do
-            (src,soff,slen,_,_,_) <- getState
-            if soff + len < slen
+            PS {..} <- getState
+            if _soff + len < _slen
                 then do
-                    liftIO $ F.copyBytes ptr (src `plusPtr` soff) len
+                    liftIO $ F.copyBytes ptr (_src `plusPtr` _soff) len
                     advanceSrc len
                 else do
-                    let srem = slen-soff
-                    liftIO $ F.copyBytes ptr (src `plusPtr` soff) srem
+                    let srem = _slen-_soff
+                    liftIO $ F.copyBytes ptr (_src `plusPtr` _soff) srem
                     demandInput
                     go (ptr `plusPtr` srem) (len-srem)
 
 -- | Decodes a single LZ4 sequence within a block (lit len, lits, offset backwards, copy len).
 -- Returns the number of bytes written to the destination
-decodeSequence :: PtrParser Int
+decodeSequence :: Decoder Int
 decodeSequence = do
     token <- getWord8
     let lLen = fromIntegral $ token `shiftR` 4
@@ -331,7 +355,7 @@ decodeSequence = do
     else
         return litLength
 
-decodeSequences :: Int -> PtrParser ()
+decodeSequences :: Int -> Decoder ()
 decodeSequences len 
     | len < 0   = err $ "decodeSequence: read more than block length bytes from source: " ++ show len
     | len == 0  = return ()
@@ -339,7 +363,7 @@ decodeSequences len
         ssize <- decodeSequence
         decodeSequences (len-ssize)
     
-getBlock :: PtrParser ()
+getBlock :: Decoder ()
 getBlock = do
     len' <- getWord32LE
     let len = fromIntegral (len' `clearBit` 31)
@@ -353,26 +377,26 @@ getBlock = do
 
 test1 :: IO Bool
 test1 = do
-    r <- startPParse getBlock  $ pack [15,0,0,0, 0x56, 49, 50,51,52,53, 5,0]
+    r <- startDecoder getBlock $ pack [15,0,0,0, 0x56, 49,50,51,52,53, 5,0]
     case r of
-        Done bs -> return $ bs == pack [49, 50,51,52,53,49, 50,51,52,53,49, 50,51,52,53]
+        Done bs -> return $ bs == pack [49, 50,51,52,53,49,50,51,52,53,49, 50,51,52,53]
         _ -> return False
  
 
 test2 :: IO Bool
 test2 = do
-    r <- startPParse getBlock  $ pack [15,0,0,0, 0x56, 49, 50,51,52,53, 5,0,0,0,0,0]
+    r <- startDecoder getBlock $ pack [15,0,0,0, 0x56, 49,50,51,52,53, 5,0,0,0,0,0]
     case r of
-        Block bs res -> return $ bs  == pack [49, 50,51,52,53,49, 50,51,52,53,49, 50,51,52,53]
+        Block bs res -> return $ bs  == pack [49, 50,51,52,53,49,50,51,52,53,49, 50,51,52,53]
                               && res == pack [0,0,0,0]
         _ -> return False
  
 test3 :: IO Bool
 test3 = do
-    r <- startPParse getBlock  $ pack [30,0,0,0, 0x56, 49, 50,51,52,53, 5,0, 0x56, 49, 50,51,52,53, 5,0]
+    r <- startDecoder getBlock $ pack [30,0,0,0, 0x56, 49,50,51,52,53, 5,0, 0x56, 49, 50,51,52,53, 5,0]
     case r of
-        Done bs -> return $ bs == pack [49, 50,51,52,53,49, 50,51,52,53,49, 50,51,52,53,
-                                        49, 50,51,52,53,49, 50,51,52,53,49, 50,51,52,53]
+        Done bs -> return $ bs == pack [49,50,51,52,53,49,50,51,52,53,49,50,51,52,53,
+                                        49,50,51,52,53,49,50,51,52,53,49,50,51,52,53]
         _ -> return False
 
 
