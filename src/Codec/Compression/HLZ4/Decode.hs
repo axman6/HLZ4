@@ -1,11 +1,11 @@
-{-# LANGUAGE BangPatterns, ExistentialQuantification, 
+{-# LANGUAGE BangPatterns, ExistentialQuantification,
     TypeSynonymInstances, FlexibleInstances, MultiParamTypeClasses,
     RecordWildCards #-}
 
 module Codec.Compression.HLZ4.Decode
     -- (
     -- decompress
-    -- ) 
+    -- )
     where
 
 
@@ -37,7 +37,7 @@ debug = False
 type P8 = Ptr Word8
 -- | tuple of src and dest pointers, offset into and their lengths
 -- type PtrState = (P8, Int, Int, P8, Int, Int)
-data PtrState = PS { 
+data PtrState = PS {
     _src  :: !P8,
     _soff :: !Int,
     _slen :: !Int,
@@ -67,7 +67,7 @@ runDecoder (Decoder p) = p
 
 data DResult a
     = DDone a
-            -- ^ returns the src ptr and the length remaining, and a pointer to 
+            -- ^ returns the src ptr and the length remaining, and a pointer to
     | DPartial (Decoder a)
         -- ^ More input is required, pass in a Ptr Word8 and the length in bytes
     | DError String
@@ -107,9 +107,9 @@ instance MonadIO Decoder where
     liftIO m = Decoder $ \s -> do
         x <- m
         return (s,DDone x)
-    
+
 -- setSrc :: (P8,Int,Int) -> Decoder ()
--- setSrc (src,soff,slen) = do 
+-- setSrc (src,soff,slen) = do
 --     Decoder $ \(_,_,_,dst,doff,dlen) ->
 --         return ((src,soff,slen,dst,doff,dlen),DDone ())
 
@@ -147,8 +147,8 @@ runD input s (Decoder p) = do
             if (_soff s' == _slen s')
                 then return $ Done res
                 else return $ Block res (BS.drop (_soff s') input)
-                    
-        DPartial g -> 
+
+        DPartial g ->
             return $ Partial (feed s' g)
         DError str -> return $ Error str
 
@@ -215,7 +215,7 @@ getWord8 = do
             b <- liftIO $ peekByte _src _soff
             when debug $ liftIO $ printf "getWord8: %d\n" b
             return b
-        else demandInput >> getWord8 
+        else demandInput >> getWord8
 {-# INLINE getWord8 #-}
 
 getWord16LE :: Decoder Word16
@@ -246,7 +246,7 @@ getWord32LE = do
             d <- getWord8
             return (fi8 d `shiftL` 24 .|.  fi8 c `shiftL` 16 .|. fi8 b `shiftL` 8 .|. fi8 a)
 {-# INLINE getWord32LE #-}
- 
+
 
 -- | Allocate a new destination buffer, returning the bytestring representing the
 -- current destination buffer.
@@ -266,7 +266,7 @@ getLength = go 0 where
         b <- getWord8
         case b of
             255 -> go (n+255)
-            _   -> return (n + fromIntegral b)   
+            _   -> return (n + fromIntegral b)
 {-# INLINE getLength #-}
 
 -- | Transfers `count` bytes from src into dest. If there are not enough
@@ -275,8 +275,8 @@ getLength = go 0 where
 transfer :: Int -> Decoder ()
 transfer count = do
     PS {..} <- getState
-    if _doff + count >= _dlen 
-        then err $ "transfer: transfer of " 
+    if _doff + count >= _dlen
+        then err $ "transfer: transfer of "
                  ++ show count
                  ++ " bytes would overflow destination buffer "
                  ++ show (_doff,_dlen)
@@ -298,15 +298,15 @@ transfer count = do
 lookback :: Int -> Int -> Decoder ()
 lookback count offset = do
     PS {..} <- getState
-    when (_doff + count > _dlen) $ 
+    when (_doff + count > _dlen) $
         err $ "lookback: copy of " ++ show count ++ " bytes would overflow destination buffer"
     when (offset > _doff) $
         err $ "lookback: copy from offset " ++ show offset ++ " before beginning of buffer, dest offset: " ++ show _doff
     let mmove :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
         mmove !_ !_ 0 = return ()
-        mmove dest src n = peek src >>= poke dest 
+        mmove dest src n = peek src >>= poke dest
                            >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
-    
+
     liftIO $ mmove (_dst `plusPtr` _doff) (_dst `plusPtr` (_doff-offset)) count
     advanceDest count
 
@@ -338,11 +338,11 @@ decodeSequence = do
     let lLen = fromIntegral $ token `shiftR` 4
         mLen = fromIntegral $ (token .&. 0x0F) + 4
     -- Write literals
-    litLength <- if lLen == 15 
-                then (15+) <$> getLength 
+    litLength <- if lLen == 15
+                then (15+) <$> getLength
                 else return lLen
     transfer litLength
-    
+
     -- copy length from offset
     drem <- getDestRemaining
     if drem > 0 then do
@@ -356,13 +356,13 @@ decodeSequence = do
         return litLength
 
 decodeSequences :: Int -> Decoder ()
-decodeSequences len 
+decodeSequences len
     | len < 0   = err $ "decodeSequence: read more than block length bytes from source: " ++ show len
     | len == 0  = return ()
     | otherwise = do
         ssize <- decodeSequence
         decodeSequences (len-ssize)
-    
+
 getBlock :: Decoder ()
 getBlock = do
     len' <- getWord32LE
@@ -372,7 +372,7 @@ getBlock = do
     if testBit len' 31
         then transfer len
         else decodeSequences len
-        
+
 -- Tests --
 
 test1 :: IO Bool
@@ -381,7 +381,7 @@ test1 = do
     case r of
         Done bs -> return $ bs == pack [49, 50,51,52,53,49,50,51,52,53,49, 50,51,52,53]
         _ -> return False
- 
+
 
 test2 :: IO Bool
 test2 = do
@@ -390,7 +390,7 @@ test2 = do
         Block bs res -> return $ bs  == pack [49, 50,51,52,53,49,50,51,52,53,49, 50,51,52,53]
                               && res == pack [0,0,0,0]
         _ -> return False
- 
+
 test3 :: IO Bool
 test3 = do
     r <- startDecoder getBlock $ pack [30,0,0,0, 0x56, 49,50,51,52,53, 5,0, 0x56, 49, 50,51,52,53, 5,0]
