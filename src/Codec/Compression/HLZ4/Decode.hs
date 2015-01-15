@@ -3,9 +3,7 @@
     RecordWildCards #-}
 
 module Codec.Compression.HLZ4.Decode
-    -- (
-    -- decompress
-    -- )
+
     where
 
 
@@ -43,33 +41,74 @@ data PtrState = PS {
     _slen :: !Int,
     _dst  :: !P8,
     _doff :: !Int,
-    _dlen :: !Int}
+    _prev :: !P8,
+    _written :: !Int
+    }
+
+
+
 
 advanceSrcState :: Int -> PtrState -> PtrState
 advanceSrcState n st =
     st {_soff = _soff st + n}
 
+-- Advances the destination offset and the number of bytes written
 advanceDestState :: Int -> PtrState -> PtrState
 advanceDestState n st =
-    st {_doff = _doff st + n}
+    st {_doff = _doff st + n, _written = _written st + n}
 
 
 advanceBothState :: Int -> PtrState -> PtrState
 advanceBothState n st =
-    st {_soff = _soff st + n, _doff = _doff st + n}
+    st {_soff = _soff st + n, _doff = _doff st + n, _written = _written st + n}
+
+emptyPtrState :: PtrState
+emptyPtrState = PS nullPtr 0 0
+                   nullPtr 0
+                   nullPtr 0
 
 
 
-newtype Decoder a = Decoder (PtrState -> IO (PtrState, DResult a))
+-- -- | Allocate a new destination buffer, returning the bytestring representing the
+-- -- current destination buffer.
+-- allocateDest :: Int -> Decoder ByteString
+-- allocateDest n =
+--     Decoder $ \st -> do
+--         fptr <- newForeignPtr finalizerFree (_dst st)
+--         let res = fromForeignPtr fptr 0 (_doff st)
+--         dst' <- mallocBytes n
+--         return ( st {_dst = dst', _doff = 0, _dlen = n}, DDone res)
 
-runDecoder :: Decoder a -> PtrState -> IO (PtrState, DResult a)
-runDecoder (Decoder p) = p
+chunkSize :: Int
+chunkSize = 65535
+{-# INLINE chunkSize #-}
+
+-- | Allocates a destination chunk of chunkSize bytes
+newPtrState :: Int -> IO PtrState
+newPtrState n = do
+    dst <- mallocBytes chunkSize
+    return $ PS nullPtr 0 0 -- source, offset and len
+                dst 0 -- dest and offset
+                nullPtr -- previous buffer
+                0 -- bytes written
+
+
+
+newtype Decoder a = Decoder { runDecoder :: PtrState -> IO (PtrState, DResult a)}
+
+-- runDecoder :: Decoder a -> PtrState -> IO (PtrState, DResult a)
+-- runDecoder (Decoder p) = p
 
 data DResult a
     = DDone a
             -- ^ returns the src ptr and the length remaining, and a pointer to
     | DPartial (Decoder a)
         -- ^ More input is required, pass in a Ptr Word8 and the length in bytes
+    | DEmit ByteString (Decoder a)
+        -- ^ A chunk of output has been decoded so emit it
+    | DFinal ByteString
+        -- ^ The final chunk of output - This is the only chunk which may be less
+        -- than `chunkSize` bytes long
     | DError String
         -- ^ Something bad happened
 
@@ -77,8 +116,8 @@ instance Show a => Show (DResult a) where
     show x = case x of
         DDone a -> "DDone " ++ show a
         DError str -> "DError: " ++ str
+        DEmit _bs _cont -> "DEmit <bs> <p>"
         DPartial _ -> "DPartial <p>"
-
 
 instance Functor Decoder where
     fmap f m = m >>= return . f
@@ -90,6 +129,7 @@ instance Applicative Decoder where
 instance Monad Decoder where
     return a = Decoder $ \s -> return (s,DDone a)
     {-# INLINE return #-}
+
     Decoder m >>= f = Decoder $ \s -> do
         (s',r) <- m s
         case r of
@@ -97,21 +137,21 @@ instance Monad Decoder where
                 let Decoder fx = f x in fx s'
             DPartial g  ->
                 return $ (s',DPartial (g >>= f))
+            DEmit bs p ->
+                return (s', DEmit bs (p >>= f))
+            DFinal bs ->
+                return (s', DFinal bs)
             DError str  ->
                 return (s',DError str)
     {-# INLINE (>>=) #-}
 
-
+    fail str = Decoder $ \s -> return (s,DError str)
 
 instance MonadIO Decoder where
     liftIO m = Decoder $ \s -> do
         x <- m
         return (s,DDone x)
 
--- setSrc :: (P8,Int,Int) -> Decoder ()
--- setSrc (src,soff,slen) = do
---     Decoder $ \(_,_,_,dst,doff,dlen) ->
---         return ((src,soff,slen,dst,doff,dlen),DDone ())
 
 
 demandInput :: Decoder ()
@@ -125,6 +165,232 @@ putState s = Decoder $ \_s -> return (s,DDone ())
 
 modifyState :: (PtrState -> PtrState) -> Decoder ()
 modifyState f = Decoder $ \s -> return (f s,DDone ())
+
+
+getSrcRemaining :: Decoder Int
+getSrcRemaining = getState >>= \st -> return (_slen st - _soff st)
+
+getDestRemaining :: Decoder Int
+getDestRemaining = getState >>= \st -> return (chunkSize - _doff st)
+
+advanceSrc :: Int -> Decoder ()
+advanceSrc n = modifyState(advanceSrcState n)
+
+advanceDest :: Int -> Decoder ()
+advanceDest n = modifyState(advanceDestState n)
+
+advanceBoth :: Int -> Decoder ()
+advanceBoth n = modifyState(advanceBothState n)
+
+peekByte :: P8 -> Int -> IO Word8
+peekByte = peekByteOff
+
+fi8 :: Integral a => Word8 -> a
+fi8 = fromIntegral
+
+getWord8 :: Decoder Word8
+getWord8 = do
+    PS {..} <- getState
+    if _soff < _slen
+        then do
+            advanceSrc 1
+            b <- liftIO $ peekByte _src _soff
+            when debug $ liftIO $ printf "getWord8: %d\n" b
+            return b
+        else demandInput >> getWord8
+{-# INLINE getWord8 #-}
+
+
+getWord16LE :: Decoder Word16
+getWord16LE = do
+    PS {..} <- getState
+    if _slen - _soff >= 2
+        then do
+            advanceSrc 2
+            -- TODO: Make this cross platform; currently assumes little endian platform
+            liftIO $ peek (castPtr (_src `plusPtr` _soff))
+        else do
+            a <- getWord8
+            b <- getWord8
+            return (fi8 b `shiftL` 8 .|. fi8 a)
+{-# INLINE getWord16LE #-}
+
+
+getWord32LE :: Decoder Word32
+getWord32LE = do
+    PS {..} <- getState
+    if _slen - _soff >= 4
+        then do
+            advanceSrc 4
+            -- TODO: Make this cross platform; currently assumes little endian platform
+            liftIO $ peek (castPtr (_src `plusPtr` _soff))
+        else do
+            a <- getWord8
+            b <- getWord8
+            c <- getWord8
+            d <- getWord8
+            return (fi8 d `shiftL` 24 .|.  fi8 c `shiftL` 16 .|. fi8 b `shiftL` 8 .|. fi8 a)
+{-# INLINE getWord32LE #-}
+
+-- | Allocate a new destination buffer, returning the bytestring representing the
+-- current destination buffer.
+--
+-- This operation also sets the _prev pointer to the current _dst pointer
+-- TODO: Find out if we need to keep a reference to the bytestring to stop the
+--       _prev pointer being deallocated by the GC
+allocateDest :: Decoder ByteString
+allocateDest =
+    Decoder $ \st -> do
+        fptr <- newForeignPtr finalizerFree (_dst st)
+        let res = fromForeignPtr fptr 0 (_doff st)
+        dst' <- mallocBytes chunkSize
+        return ( st {_dst = dst', _doff = 0, _prev = _dst st}, DDone res)
+
+
+-- | Emits a full `ByteString` of length `chunkSize`. If the destination buffer is not full,
+-- an error is returned.
+emitFullBuffer :: Decoder ()
+emitFullBuffer =
+    Decoder $ \st -> do
+        if (_doff st /= chunkSize)
+            then return (st,DError $ "emitFullBuffer: buffer is not full (" ++ show (_doff st) ++ ")")
+            else do
+                fptr <- newForeignPtr finalizerFree (_dst st)
+                let res = fromForeignPtr fptr 0 chunkSize
+                dst' <- mallocBytes chunkSize
+                return ( st {_dst = dst', _doff = 0, _prev = _dst st}, DEmit res (return ()))
+
+emitFinalBuffer :: Decoder a
+emitFinalBuffer = Decoder $ \st -> do
+    fptr <- newForeignPtr finalizerFree (_dst st)
+    let res = fromForeignPtr fptr 0 (_doff st)
+    return ( st, DFinal res)
+
+-- ====================================================
+-- LZ4 specific decoding functions
+-- ====================================================
+
+
+
+-- | Decodes a number encoded using repeated values of 255 and returns how many bytes were used
+getLength :: Decoder Int
+getLength = go 0 where
+    go n = do
+        b <- getWord8
+        case b of
+            255 -> go (n+255)
+            _   -> return (n + fromIntegral b)
+{-# INLINE getLength #-}
+
+
+-- | Transfers `count` bytes from src into dest. If there are not enough
+-- bytes in src, the remaining bytes will be copied and more input demanded.
+-- If there is not enough room in the destination, the destination is filled
+-- and, the `ByteString` is emitted and a new destination is allocated.
+transfer :: Int -> Decoder ()
+transfer count = do
+    PS {..} <- getState
+    let srem = _slen     - _soff
+        drem = chunkSize - _doff
+   case (count <= srem, count <= drem) of
+        (True, True) -> do
+            liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) count
+            advanceBoth count
+        (False, False) -> do
+            let len = min srem drem
+            liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) len
+            advanceBoth len
+            emitFullBuffer
+            demandInput
+            transfer (count - len)
+        (True, False) -> do
+            liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) drem
+            advanceBoth drem
+            emitFullBuffer
+            transfer (count - drem)
+        (False, True) -> do
+            liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) srem
+            advanceBoth srem
+            demandInput
+            transfer (count - srem)
+
+-- | Moves `count` bytes of data from `offset` bytes before current position into
+-- the destination.
+lookback :: Int -> Int -> Decoder ()
+lookback count offset = do
+    let -- Like moveBytes, but the regions may overlap; copying is done byte by byte
+        -- so that repetitions can be handled. Necessary because moveBytes checks
+        -- for overlapping regions and does the copy in a way that doesn't copy data
+        -- already written to the destination pointer.
+        mmove :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
+        mmove !_ !_ 0 = return ()
+        mmove dest src n = peek src >>= poke dest
+                           >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
+
+    PS {..} <- getState
+
+    when (offset > _doff && _prev == nullPtr) $
+        err $ "lookback: attempting to copy from previous chunk, but chunk is NULL"
+
+
+
+
+    -- Determine which bytes to copy from previous chunk
+    if offset <= _doff
+        then return ()
+        else do
+            let drem = chunkSize - _doff
+                prevOffset = offset - _doff
+                prevBytes = min count (chunkSize - prevOffset)
+
+
+
+    let drem        = chunkSize - _doff
+        prevBytes   = if offset > _doff then min count (chunkSize - _doff + 1) else 0
+        prevOffset  = chunkSize - (count - _doff)
+        bytesLeft   = count - prevBytes
+        curBytes    = if bytesLeft > drem then drem else bytesLeft
+        curOffset   = if prevOffset > 0 then 0 else offset
+        remaining   = bytesLeft - curBytes
+
+    if offset > _doff
+        then do
+            let prevBytes = offset - _doff
+                prevOffset = chunkSize - prevBytes + 1 -- I think?
+            liftIO $ mmove (_dst `plusPtr` _doff) (_dst `plusPtr` (_doff-offset)) count
+
+
+
+
+    when (_doff + count > _dlen) $
+        err $ "lookback: copy of " ++ show count ++ " bytes would overflow destination buffer"
+    when (offset > _doff) $
+        err $ "lookback: copy from offset " ++ show offset ++ " before beginning of buffer, dest offset: " ++ show _doff
+
+
+    liftIO $ mmove (_dst `plusPtr` _doff) (_dst `plusPtr` (_doff-offset)) count
+    advanceDest count
+
+-- startDecoder :: Show a => Decoder a -> ByteString -> IO HLZ4Result
+-- startDecoder p bs = do
+--    let (srcptr, off, len) = toForeignPtr bs
+--    st <- newPtrState
+--    -- r <- runD bs (PS (unsafeForeignPtrToPtr srcptr) off len nullPtr 0 0) p
+--    r <- runD bs (st {_src = (unsafeForeignPtrToPtr srcptr),
+--                      _soff = off,
+--                      _slen = len})
+--                 p
+--    touchForeignPtr srcptr
+--    return r
+
+{-
+
+
+-- setSrc :: (P8,Int,Int) -> Decoder ()
+-- setSrc (src,soff,slen) = do
+--     Decoder $ \(_,_,_,dst,doff,dlen) ->
+--         return ((src,soff,slen,dst,doff,dlen),DDone ())
+
 
 
 startDecoder :: Show a => Decoder a -> ByteString -> IO HLZ4Result
@@ -179,136 +445,6 @@ instance Show HLZ4Result where
 err :: String -> Decoder a
 err str = Decoder $ \s -> return $ (s,DError str)
 
-
-
-getSrcRemaining :: Decoder Int
-getSrcRemaining = getState >>= \st -> return (_slen st - _soff st)
-
-getDestRemaining :: Decoder Int
-getDestRemaining = getState >>= \st -> return (_dlen st - _doff st)
-
-
-
-
-advanceSrc :: Int -> Decoder ()
-advanceSrc n = modifyState(advanceSrcState n)
-
-advanceDest :: Int -> Decoder ()
-advanceDest n = modifyState(advanceDestState n)
-
-advanceBoth :: Int -> Decoder ()
-advanceBoth n = modifyState(advanceBothState n)
-
-
-peekByte :: Ptr Word8 -> Int -> IO Word8
-peekByte = peekByteOff
-
-fi8 :: Integral a => Word8 -> a
-fi8 = fromIntegral
-
-getWord8 :: Decoder Word8
-getWord8 = do
-    PS {..} <- getState
-    if _soff < _slen
-        then do
-            advanceSrc 1
-            b <- liftIO $ peekByte _src _soff
-            when debug $ liftIO $ printf "getWord8: %d\n" b
-            return b
-        else demandInput >> getWord8
-{-# INLINE getWord8 #-}
-
-getWord16LE :: Decoder Word16
-getWord16LE = do
-    PS {..} <- getState
-    if _slen - _soff >= 2
-        then do
-            advanceSrc 2
-            liftIO $ peek (castPtr (_src `plusPtr` _soff))
-        else do
-            a <- getWord8
-            b <- getWord8
-            return (fi8 b `shiftL` 8 .|. fi8 a)
-{-# INLINE getWord16LE #-}
-
-
-getWord32LE :: Decoder Word32
-getWord32LE = do
-    PS {..} <- getState
-    if _slen - _soff >= 4
-        then do
-            advanceSrc 4
-            liftIO $ peek (castPtr (_src `plusPtr` _soff))
-        else do
-            a <- getWord8
-            b <- getWord8
-            c <- getWord8
-            d <- getWord8
-            return (fi8 d `shiftL` 24 .|.  fi8 c `shiftL` 16 .|. fi8 b `shiftL` 8 .|. fi8 a)
-{-# INLINE getWord32LE #-}
-
-
--- | Allocate a new destination buffer, returning the bytestring representing the
--- current destination buffer.
-allocateDest :: Int -> Decoder ByteString
-allocateDest n =
-    Decoder $ \st -> do
-        fptr <- newForeignPtr finalizerFree (_dst st)
-        let res = fromForeignPtr fptr 0 (_doff st)
-        dst' <- mallocBytes n
-        return ( st {_dst = dst', _doff = 0, _dlen = n}, DDone res)
-
-
--- | Decodes a number encoded using repeated values of 255 and returns how many bytes were used
-getLength :: Decoder Int
-getLength = go 0 where
-    go n = do
-        b <- getWord8
-        case b of
-            255 -> go (n+255)
-            _   -> return (n + fromIntegral b)
-{-# INLINE getLength #-}
-
--- | Transfers `count` bytes from src into dest. If there are not enough
--- bytes in src, the remaining bytes will be copied and more input demanded.
--- If there is not enough room in the destination and error is produced.
-transfer :: Int -> Decoder ()
-transfer count = do
-    PS {..} <- getState
-    if _doff + count >= _dlen
-        then err $ "transfer: transfer of "
-                 ++ show count
-                 ++ " bytes would overflow destination buffer "
-                 ++ show (_doff,_dlen)
-        else if _soff + count < _slen
-            then do
-                liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) count
-                advanceBoth count
-            else do
-                let srem = _slen - _soff
-                liftIO $ F.copyBytes (_dst `plusPtr` _doff) (_src `plusPtr` _soff) srem
-                advanceDest srem
-                demandInput
-                transfer (count-srem)
-
-
--- | Moves `count` bytes of data from `offset` bytes before current position into
--- the current position in the destination, and advances the state. If count is greater
--- than the space remaining in the destination buffer, an error is returned.
-lookback :: Int -> Int -> Decoder ()
-lookback count offset = do
-    PS {..} <- getState
-    when (_doff + count > _dlen) $
-        err $ "lookback: copy of " ++ show count ++ " bytes would overflow destination buffer"
-    when (offset > _doff) $
-        err $ "lookback: copy from offset " ++ show offset ++ " before beginning of buffer, dest offset: " ++ show _doff
-    let mmove :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
-        mmove !_ !_ 0 = return ()
-        mmove dest src n = peek src >>= poke dest
-                           >> mmove (dest `plusPtr` 1) (src `plusPtr` 1) (n-1)
-
-    liftIO $ mmove (_dst `plusPtr` _doff) (_dst `plusPtr` (_doff-offset)) count
-    advanceDest count
 
 
 getByteString :: Int -> Decoder ByteString
@@ -399,5 +535,5 @@ test3 = do
                                         49,50,51,52,53,49,50,51,52,53,49,50,51,52,53]
         _ -> return False
 
-
+-}
 
